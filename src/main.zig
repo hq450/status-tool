@@ -1,5 +1,8 @@
 const std = @import("std");
 const build_options = @import("build_options");
+const c = @cImport({
+    @cInclude("time.h");
+});
 
 const version = build_options.version;
 
@@ -56,6 +59,7 @@ const RunResult = struct {
 const ConfigFile = struct {
     interval_ms: ?u32 = null,
     state_file: ?[]const u8 = null,
+    legacy_file: ?[]const u8 = null,
     output: ?OutputFormat = null,
     probes: []ProbeSpec,
 };
@@ -93,6 +97,36 @@ const ProbeError = error{
     UnexpectedEof,
 };
 
+fn statusCodeOk(code: u16) bool {
+    return code == 200 or code == 204 or code == 301 or code == 302;
+}
+
+fn localTimeTextAlloc(allocator: std.mem.Allocator) ![]const u8 {
+    var now: c.time_t = @intCast(std.time.timestamp());
+    const tm_ptr = c.localtime(&now) orelse return error.LocalTimeFailed;
+    var buf: [32]u8 = undefined;
+    const len = c.strftime(&buf, buf.len, "%Y-%m-%d %H:%M:%S", tm_ptr);
+    if (len == 0) return error.LocalTimeFailed;
+    return try allocator.dupe(u8, buf[0..len]);
+}
+
+fn findProbeResult(run_result: RunResult, name: []const u8) ?ProbeResult {
+    for (run_result.results) |res| {
+        if (std.mem.eql(u8, res.name, name)) return res;
+    }
+    return null;
+}
+
+fn appendFancyssLine(list: *std.ArrayList(u8), allocator: std.mem.Allocator, label: []const u8, ts: []const u8, res: ?ProbeResult) !void {
+    if (res) |item| {
+        if (item.ok and statusCodeOk(item.status_code)) {
+            try list.print(allocator, "{s} 【{s}】 ✓&nbsp;&nbsp;{d} ms", .{ label, ts, item.elapsed_ms });
+            return;
+        }
+    }
+    try list.print(allocator, "{s} 【{s}】 <font color=\"#FF0000\">X</font>", .{ label, ts });
+}
+
 fn printUsage() void {
     std.debug.print(
         \\status-tool {s}
@@ -117,7 +151,12 @@ fn printUsage() void {
         \\
         \\daemon options:
         \\  --config <path>
+        \\  --china-url <http-url>
+        \\  --foreign-url <http-url>
+        \\  --proxy-ipv6 <0|1>
+        \\  --foreign-proxy <socks5://host:port>
         \\  --state-file <path>
+        \\  --legacy-file <path>
         \\  --interval-ms <ms>
         \\  --format <json|text>
         \\  --stdout
@@ -151,6 +190,65 @@ fn parseU32(text: []const u8) !u32 {
 
 fn parseU8(text: []const u8) !u8 {
     return try std.fmt.parseInt(u8, text, 10);
+}
+
+fn jsonGetString(value: std.json.Value) ![]const u8 {
+    return switch (value) {
+        .string => |v| v,
+        else => error.InvalidConfig,
+    };
+}
+
+fn jsonGetOptionalString(obj: std.json.ObjectMap, key: []const u8) !?[]const u8 {
+    if (obj.get(key)) |value| {
+        return try jsonGetString(value);
+    }
+    return null;
+}
+
+fn jsonGetU32(value: std.json.Value) !u32 {
+    return switch (value) {
+        .integer => |v| if (v >= 0) @intCast(v) else error.InvalidConfig,
+        .number_string => |v| try parseU32(v),
+        else => error.InvalidConfig,
+    };
+}
+
+fn jsonGetOptionalU32(obj: std.json.ObjectMap, key: []const u8) !?u32 {
+    if (obj.get(key)) |value| {
+        return try jsonGetU32(value);
+    }
+    return null;
+}
+
+fn jsonGetOptionalU8(obj: std.json.ObjectMap, key: []const u8) !?u8 {
+    if (obj.get(key)) |value| {
+        const parsed = try jsonGetU32(value);
+        if (parsed > std.math.maxInt(u8)) return error.InvalidConfig;
+        return @intCast(parsed);
+    }
+    return null;
+}
+
+fn jsonGetOptionalFamily(obj: std.json.ObjectMap, key: []const u8) !?Family {
+    if (obj.get(key)) |value| {
+        return try parseFamily(try jsonGetString(value));
+    }
+    return null;
+}
+
+fn jsonGetOptionalProbeMode(obj: std.json.ObjectMap, key: []const u8) !?ProbeMode {
+    if (obj.get(key)) |value| {
+        return try parseProbeMode(try jsonGetString(value));
+    }
+    return null;
+}
+
+fn jsonGetOptionalOutputFormat(obj: std.json.ObjectMap, key: []const u8) !?OutputFormat {
+    if (obj.get(key)) |value| {
+        return try parseOutputFormat(try jsonGetString(value));
+    }
+    return null;
 }
 
 fn parseHttpUrl(arena: std.mem.Allocator, raw_url: []const u8) !ParsedUrl {
@@ -453,13 +551,29 @@ fn runResultToTextAlloc(allocator: std.mem.Allocator, run_result: RunResult) ![]
     return try list.toOwnedSlice(allocator);
 }
 
-fn writeRunResultFile(allocator: std.mem.Allocator, path: []const u8, format: OutputFormat, run_result: RunResult) !void {
-    const dir_path = std.fs.path.dirname(path) orelse ".";
-    try std.fs.cwd().makePath(dir_path);
-    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp.{d}", .{ path, std.time.milliTimestamp() });
-    defer allocator.free(tmp_path);
+fn runResultToFancyssAlloc(allocator: std.mem.Allocator, run_result: RunResult) ![]u8 {
+    const ts = try localTimeTextAlloc(allocator);
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(allocator);
+    const china = findProbeResult(run_result, "china");
+    const foreign4 = findProbeResult(run_result, "foreign4");
+    const foreign6 = findProbeResult(run_result, "foreign6");
+    const has_ipv6 = foreign6 != null;
 
-    var file = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true, .read = true });
+    if (has_ipv6) {
+        try appendFancyssLine(&list, allocator, "国外IPv4", ts, foreign4);
+        try list.appendSlice(allocator, "@@");
+        try appendFancyssLine(&list, allocator, "国外IPv6", ts, foreign6);
+    } else {
+        try appendFancyssLine(&list, allocator, "国外链接", ts, foreign4);
+    }
+    try list.appendSlice(allocator, "@@");
+    try appendFancyssLine(&list, allocator, "国内连接", ts, china);
+    return try list.toOwnedSlice(allocator);
+}
+
+fn writeRunResultFile(allocator: std.mem.Allocator, path: []const u8, format: OutputFormat, run_result: RunResult) !void {
+    var file = try std.fs.cwd().createFile(path, .{ .truncate = true });
     defer file.close();
     const output = switch (format) {
         .json => try runResultToJsonAlloc(allocator, run_result),
@@ -467,14 +581,53 @@ fn writeRunResultFile(allocator: std.mem.Allocator, path: []const u8, format: Ou
     };
     defer allocator.free(output);
     try file.writeAll(output);
-    try file.sync();
-    try std.fs.cwd().rename(tmp_path, path);
+}
+
+fn writeBytesFile(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8) !void {
+    _ = allocator;
+    var file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(bytes);
 }
 
 fn readConfigFile(allocator: std.mem.Allocator, path: []const u8) !ConfigFile {
     const bytes = try std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024);
-    const parsed = try std.json.parseFromSlice(ConfigFile, allocator, bytes, .{ .ignore_unknown_fields = true });
-    return parsed.value;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    const root = parsed.value;
+    if (root != .object) return error.InvalidConfig;
+
+    const root_obj = root.object;
+    var probe_list: std.ArrayList(ProbeSpec) = .empty;
+
+    if (root_obj.get("probes")) |probes_value| {
+        if (probes_value != .array) return error.InvalidConfig;
+        for (probes_value.array.items) |item| {
+            if (item != .object) return error.InvalidConfig;
+            const obj = item.object;
+            var probe = ProbeSpec{
+                .url = try jsonGetString(obj.get("url") orelse return error.InvalidConfig),
+            };
+            probe.name = (try jsonGetOptionalString(obj, "name")) orelse probe.url;
+            probe.family = (try jsonGetOptionalFamily(obj, "family")) orelse .auto;
+            probe.mode = (try jsonGetOptionalProbeMode(obj, "mode")) orelse .direct;
+            probe.proxy = try jsonGetOptionalString(obj, "proxy");
+            probe.timeout_ms = (try jsonGetOptionalU32(obj, "timeout_ms")) orelse 3000;
+            probe.warmup = (try jsonGetOptionalU8(obj, "warmup")) orelse 1;
+            probe.attempts = (try jsonGetOptionalU8(obj, "attempts")) orelse 2;
+            probe.user_agent = try jsonGetOptionalString(obj, "user_agent");
+            try probe_list.append(allocator, probe);
+        }
+    } else {
+        return error.InvalidConfig;
+    }
+
+    return .{
+        .interval_ms = try jsonGetOptionalU32(root_obj, "interval_ms"),
+        .state_file = try jsonGetOptionalString(root_obj, "state_file"),
+        .legacy_file = try jsonGetOptionalString(root_obj, "legacy_file"),
+        .output = try jsonGetOptionalOutputFormat(root_obj, "output"),
+        .probes = try probe_list.toOwnedSlice(allocator),
+    };
 }
 
 const OnceOptions = struct {
@@ -551,8 +704,13 @@ fn parseOnceOptions(allocator: std.mem.Allocator, argv: []const [:0]u8) !OnceOpt
 }
 
 const DaemonOptions = struct {
-    config_path: []const u8,
+    config_path: []const u8 = "",
+    china_url: ?[]const u8 = null,
+    foreign_url: ?[]const u8 = null,
+    proxy_ipv6: bool = false,
+    foreign_proxy: ?[]const u8 = null,
     state_file: ?[]const u8 = null,
+    legacy_file: ?[]const u8 = null,
     interval_ms: ?u32 = null,
     format: ?OutputFormat = null,
     stdout: bool = false,
@@ -560,7 +718,7 @@ const DaemonOptions = struct {
 };
 
 fn parseDaemonOptions(argv: []const [:0]u8) !DaemonOptions {
-    var opts = DaemonOptions{ .config_path = "" };
+    var opts = DaemonOptions{};
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
         const arg = argv[i];
@@ -568,10 +726,30 @@ fn parseDaemonOptions(argv: []const [:0]u8) !DaemonOptions {
             i += 1;
             if (i >= argv.len) return error.InvalidArgument;
             opts.config_path = argv[i];
+        } else if (std.mem.eql(u8, arg, "--china-url")) {
+            i += 1;
+            if (i >= argv.len) return error.InvalidArgument;
+            opts.china_url = argv[i];
+        } else if (std.mem.eql(u8, arg, "--foreign-url")) {
+            i += 1;
+            if (i >= argv.len) return error.InvalidArgument;
+            opts.foreign_url = argv[i];
+        } else if (std.mem.eql(u8, arg, "--proxy-ipv6")) {
+            i += 1;
+            if (i >= argv.len) return error.InvalidArgument;
+            opts.proxy_ipv6 = std.mem.eql(u8, argv[i], "1") or std.mem.eql(u8, argv[i], "true");
+        } else if (std.mem.eql(u8, arg, "--foreign-proxy")) {
+            i += 1;
+            if (i >= argv.len) return error.InvalidArgument;
+            opts.foreign_proxy = argv[i];
         } else if (std.mem.eql(u8, arg, "--state-file")) {
             i += 1;
             if (i >= argv.len) return error.InvalidArgument;
             opts.state_file = argv[i];
+        } else if (std.mem.eql(u8, arg, "--legacy-file")) {
+            i += 1;
+            if (i >= argv.len) return error.InvalidArgument;
+            opts.legacy_file = argv[i];
         } else if (std.mem.eql(u8, arg, "--interval-ms")) {
             i += 1;
             if (i >= argv.len) return error.InvalidArgument;
@@ -588,8 +766,55 @@ fn parseDaemonOptions(argv: []const [:0]u8) !DaemonOptions {
             return error.InvalidArgument;
         }
     }
-    if (opts.config_path.len == 0) return error.InvalidArgument;
+    if (opts.config_path.len == 0 and (opts.china_url == null or opts.foreign_url == null)) return error.InvalidArgument;
     return opts;
+}
+
+fn buildFancyssProbeSpecs(allocator: std.mem.Allocator, opts: DaemonOptions) ![]ProbeSpec {
+    var list: std.ArrayList(ProbeSpec) = .empty;
+    const china_url = opts.china_url orelse return error.InvalidArgument;
+    const foreign_url = opts.foreign_url orelse return error.InvalidArgument;
+    try list.append(allocator, .{
+        .name = "china",
+        .url = china_url,
+        .family = .ipv4,
+        .mode = .direct,
+        .warmup = 0,
+        .attempts = 1,
+        .timeout_ms = 3000,
+    });
+    if (opts.proxy_ipv6) {
+        try list.append(allocator, .{
+            .name = "foreign4",
+            .url = foreign_url,
+            .family = .ipv4,
+            .mode = .direct,
+            .warmup = 1,
+            .attempts = 2,
+            .timeout_ms = 3000,
+        });
+        try list.append(allocator, .{
+            .name = "foreign6",
+            .url = foreign_url,
+            .family = .ipv6,
+            .mode = .direct,
+            .warmup = 1,
+            .attempts = 2,
+            .timeout_ms = 3000,
+        });
+    } else {
+        try list.append(allocator, .{
+            .name = "foreign4",
+            .url = foreign_url,
+            .family = .ipv4,
+            .mode = .socks5,
+            .proxy = opts.foreign_proxy orelse "socks5://127.0.0.1:23456",
+            .warmup = 1,
+            .attempts = 2,
+            .timeout_ms = 3000,
+        });
+    }
+    return try list.toOwnedSlice(allocator);
 }
 
 fn runOnceCommand(allocator: std.mem.Allocator, argv: []const [:0]u8) !void {
@@ -612,20 +837,35 @@ fn runOnceCommand(allocator: std.mem.Allocator, argv: []const [:0]u8) !void {
 
 fn runDaemonCommand(allocator: std.mem.Allocator, argv: []const [:0]u8) !void {
     const opts = try parseDaemonOptions(argv);
-    const cfg = try readConfigFile(allocator, opts.config_path);
-    const interval_ms = opts.interval_ms orelse cfg.interval_ms orelse 5000;
-    const format = opts.format orelse cfg.output orelse .json;
-    const state_file = opts.state_file orelse cfg.state_file;
+    var cfg: ?ConfigFile = null;
+    var owned_specs: ?[]ProbeSpec = null;
+    defer if (owned_specs) |items| allocator.free(items);
+
+    if (opts.config_path.len != 0) {
+        cfg = try readConfigFile(allocator, opts.config_path);
+    } else {
+        owned_specs = try buildFancyssProbeSpecs(allocator, opts);
+    }
+
+    const interval_ms = opts.interval_ms orelse if (cfg) |cfg_file| cfg_file.interval_ms orelse 5000 else 5000;
+    const format = opts.format orelse if (cfg) |cfg_file| cfg_file.output orelse .json else .json;
+    const state_file = opts.state_file orelse if (cfg) |cfg_file| cfg_file.state_file else null;
+    const legacy_file = opts.legacy_file orelse if (cfg) |cfg_file| cfg_file.legacy_file else null;
+    const specs = if (cfg) |cfg_file| cfg_file.probes else owned_specs.?;
 
     while (true) {
         {
             var cycle_arena_state = std.heap.ArenaAllocator.init(allocator);
             defer cycle_arena_state.deinit();
             const cycle_alloc = cycle_arena_state.allocator();
-            const run_result = try runProbeList(cycle_alloc, cfg.probes);
+            const run_result = try runProbeList(cycle_alloc, specs);
 
             if (state_file) |path| {
                 try writeRunResultFile(cycle_alloc, path, format, run_result);
+            }
+            if (legacy_file) |path| {
+                const legacy = try runResultToFancyssAlloc(cycle_alloc, run_result);
+                try writeBytesFile(cycle_alloc, path, legacy);
             }
             if (opts.stdout or opts.once) {
                 const output = switch (format) {
