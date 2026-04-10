@@ -64,6 +64,16 @@ const ConfigFile = struct {
     probes: []ProbeSpec,
 };
 
+const ServeState = struct {
+    cache_allocator: std.mem.Allocator,
+    specs: []const ProbeSpec,
+    state_file: ?[]const u8,
+    legacy_file: ?[]const u8,
+    format: OutputFormat,
+    cached_json: ?[]u8 = null,
+    cached_fancyss: ?[]u8 = null,
+};
+
 const ParsedUrl = struct {
     raw: []const u8,
     host: []const u8,
@@ -79,6 +89,11 @@ const OpenedStream = struct {
 const ProxyEndpoint = struct {
     host: []const u8,
     port: u16,
+};
+
+const ServeOptions = struct {
+    socket_path: []const u8 = "/tmp/status-tool.sock",
+    daemon: DaemonOptions,
 };
 
 const ProbeError = error{
@@ -133,7 +148,10 @@ fn printUsage() void {
         \\
         \\Usage:
         \\  status-tool once [options]
+        \\  status-tool fancyss [options]
         \\  status-tool daemon --config <path> [--once]
+        \\  status-tool serve [options]
+        \\  status-tool client [options] <ping|get_cache|probe_once>
         \\  status-tool --help
         \\  status-tool --version
         \\
@@ -161,6 +179,17 @@ fn printUsage() void {
         \\  --format <json|text>
         \\  --stdout
         \\  --once
+        \\
+        \\fancyss options:
+        \\  same as daemon input options, but always runs one probe cycle
+        \\  and prints the compact fancyss legacy line format
+        \\
+        \\serve options:
+        \\  same as daemon input options
+        \\  --socket-path <path>  unix socket path, default /tmp/status-tool.sock
+        \\
+        \\client options:
+        \\  --socket-path <path>  unix socket path, default /tmp/status-tool.sock
         \\
     , .{version});
 }
@@ -770,6 +799,79 @@ fn parseDaemonOptions(argv: []const [:0]u8) !DaemonOptions {
     return opts;
 }
 
+fn parseServeOptions(argv: []const [:0]u8) !ServeOptions {
+    var opts = ServeOptions{ .daemon = .{} };
+    var i: usize = 0;
+    while (i < argv.len) : (i += 1) {
+        const arg = argv[i];
+        if (std.mem.eql(u8, arg, "--socket-path")) {
+            i += 1;
+            if (i >= argv.len) return error.InvalidArgument;
+            opts.socket_path = argv[i];
+        } else if (std.mem.eql(u8, arg, "--config")) {
+            i += 1;
+            if (i >= argv.len) return error.InvalidArgument;
+            opts.daemon.config_path = argv[i];
+        } else if (std.mem.eql(u8, arg, "--china-url")) {
+            i += 1;
+            if (i >= argv.len) return error.InvalidArgument;
+            opts.daemon.china_url = argv[i];
+        } else if (std.mem.eql(u8, arg, "--foreign-url")) {
+            i += 1;
+            if (i >= argv.len) return error.InvalidArgument;
+            opts.daemon.foreign_url = argv[i];
+        } else if (std.mem.eql(u8, arg, "--proxy-ipv6")) {
+            i += 1;
+            if (i >= argv.len) return error.InvalidArgument;
+            opts.daemon.proxy_ipv6 = std.mem.eql(u8, argv[i], "1") or std.mem.eql(u8, argv[i], "true");
+        } else if (std.mem.eql(u8, arg, "--foreign-proxy")) {
+            i += 1;
+            if (i >= argv.len) return error.InvalidArgument;
+            opts.daemon.foreign_proxy = argv[i];
+        } else if (std.mem.eql(u8, arg, "--state-file")) {
+            i += 1;
+            if (i >= argv.len) return error.InvalidArgument;
+            opts.daemon.state_file = argv[i];
+        } else if (std.mem.eql(u8, arg, "--legacy-file")) {
+            i += 1;
+            if (i >= argv.len) return error.InvalidArgument;
+            opts.daemon.legacy_file = argv[i];
+        } else if (std.mem.eql(u8, arg, "--interval-ms")) {
+            i += 1;
+            if (i >= argv.len) return error.InvalidArgument;
+            opts.daemon.interval_ms = try parseU32(argv[i]);
+        } else if (std.mem.eql(u8, arg, "--format")) {
+            i += 1;
+            if (i >= argv.len) return error.InvalidArgument;
+            opts.daemon.format = try parseOutputFormat(argv[i]);
+        } else {
+            return error.InvalidArgument;
+        }
+    }
+    if (opts.daemon.config_path.len == 0 and (opts.daemon.china_url == null or opts.daemon.foreign_url == null)) return error.InvalidArgument;
+    return opts;
+}
+
+fn parseClientOptions(argv: []const [:0]u8) !struct { socket_path: []const u8, command: []const u8 } {
+    var socket_path: []const u8 = "/tmp/status-tool.sock";
+    var command: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < argv.len) : (i += 1) {
+        const arg = argv[i];
+        if (std.mem.eql(u8, arg, "--socket-path")) {
+            i += 1;
+            if (i >= argv.len) return error.InvalidArgument;
+            socket_path = argv[i];
+        } else {
+            command = arg;
+        }
+    }
+    return .{
+        .socket_path = socket_path,
+        .command = command orelse return error.InvalidArgument,
+    };
+}
+
 fn buildFancyssProbeSpecs(allocator: std.mem.Allocator, opts: DaemonOptions) ![]ProbeSpec {
     var list: std.ArrayList(ProbeSpec) = .empty;
     const china_url = opts.china_url orelse return error.InvalidArgument;
@@ -817,6 +919,73 @@ fn buildFancyssProbeSpecs(allocator: std.mem.Allocator, opts: DaemonOptions) ![]
     return try list.toOwnedSlice(allocator);
 }
 
+fn resolveSpecsForDaemonLike(allocator: std.mem.Allocator, opts: DaemonOptions) !struct {
+    specs: []const ProbeSpec,
+    owned: ?[]ProbeSpec,
+    state_file: ?[]const u8,
+    legacy_file: ?[]const u8,
+    format: OutputFormat,
+    interval_ms: u32,
+} {
+    var cfg: ?ConfigFile = null;
+    var owned_specs: ?[]ProbeSpec = null;
+    if (opts.config_path.len != 0) {
+        cfg = try readConfigFile(allocator, opts.config_path);
+    } else {
+        owned_specs = try buildFancyssProbeSpecs(allocator, opts);
+    }
+
+    const interval_ms = opts.interval_ms orelse if (cfg) |cfg_file| cfg_file.interval_ms orelse 5000 else 5000;
+    const format = opts.format orelse if (cfg) |cfg_file| cfg_file.output orelse .json else .json;
+    const state_file = opts.state_file orelse if (cfg) |cfg_file| cfg_file.state_file else null;
+    const legacy_file = opts.legacy_file orelse if (cfg) |cfg_file| cfg_file.legacy_file else null;
+    const specs = if (cfg) |cfg_file| cfg_file.probes else owned_specs.?;
+    return .{
+        .specs = specs,
+        .owned = owned_specs,
+        .state_file = state_file,
+        .legacy_file = legacy_file,
+        .format = format,
+        .interval_ms = interval_ms,
+    };
+}
+
+fn refreshServeCache(allocator: std.mem.Allocator, state: *ServeState) !void {
+    const run_result = try runProbeList(allocator, state.specs);
+    const legacy = try runResultToFancyssAlloc(allocator, run_result);
+    if (state.state_file) |path| {
+        try writeRunResultFile(allocator, path, state.format, run_result);
+    }
+    if (state.legacy_file) |path| {
+        try writeBytesFile(allocator, path, legacy);
+    }
+    if (state.cached_fancyss) |old| state.cache_allocator.free(old);
+    state.cached_fancyss = try state.cache_allocator.dupe(u8, legacy);
+    const json_out = try runResultToJsonAlloc(allocator, run_result);
+    if (state.cached_json) |old_json| state.cache_allocator.free(old_json);
+    state.cached_json = try state.cache_allocator.dupe(u8, json_out);
+}
+
+fn handleServeCommand(allocator: std.mem.Allocator, state: *ServeState, command: []const u8) ![]const u8 {
+    if (std.mem.eql(u8, command, "ping")) {
+        return try allocator.dupe(u8, "pong\n");
+    }
+    if (std.mem.eql(u8, command, "get_cache")) {
+        if (state.cached_fancyss) |cache| {
+            return try std.fmt.allocPrint(allocator, "{s}\n", .{cache});
+        }
+        return try allocator.dupe(u8, "cache-miss\n");
+    }
+    if (std.mem.eql(u8, command, "probe_once")) {
+        try refreshServeCache(allocator, state);
+        if (state.cached_fancyss) |cache| {
+            return try std.fmt.allocPrint(allocator, "{s}\n", .{cache});
+        }
+        return try allocator.dupe(u8, "cache-miss\n");
+    }
+    return try allocator.dupe(u8, "unknown-command\n");
+}
+
 fn runOnceCommand(allocator: std.mem.Allocator, argv: []const [:0]u8) !void {
     const opts = try parseOnceOptions(allocator, argv);
     var format = opts.format;
@@ -837,6 +1006,121 @@ fn runOnceCommand(allocator: std.mem.Allocator, argv: []const [:0]u8) !void {
 
 fn runDaemonCommand(allocator: std.mem.Allocator, argv: []const [:0]u8) !void {
     const opts = try parseDaemonOptions(argv);
+    const resolved = try resolveSpecsForDaemonLike(allocator, opts);
+    defer if (resolved.owned) |items| allocator.free(items);
+
+    while (true) {
+        {
+            var cycle_arena_state = std.heap.ArenaAllocator.init(allocator);
+            defer cycle_arena_state.deinit();
+            const cycle_alloc = cycle_arena_state.allocator();
+            const run_result = try runProbeList(cycle_alloc, resolved.specs);
+
+            if (resolved.state_file) |path| {
+                try writeRunResultFile(cycle_alloc, path, resolved.format, run_result);
+            }
+            if (resolved.legacy_file) |path| {
+                const legacy = try runResultToFancyssAlloc(cycle_alloc, run_result);
+                try writeBytesFile(cycle_alloc, path, legacy);
+            }
+            if (opts.stdout or opts.once) {
+                const output = switch (resolved.format) {
+                    .json => try runResultToJsonAlloc(cycle_alloc, run_result),
+                    .text => try runResultToTextAlloc(cycle_alloc, run_result),
+                };
+                try std.fs.File.stdout().writeAll(output);
+            }
+            if (opts.once) return;
+        }
+        std.Thread.sleep(@as(u64, resolved.interval_ms) * std.time.ns_per_ms);
+    }
+}
+
+fn runServeCommand(allocator: std.mem.Allocator, argv: []const [:0]u8) !void {
+    const opts = try parseServeOptions(argv);
+    const resolved = try resolveSpecsForDaemonLike(allocator, opts.daemon);
+    defer if (resolved.owned) |items| allocator.free(items);
+
+    if (opts.socket_path.len != 0) {
+        std.fs.cwd().deleteFile(opts.socket_path) catch {};
+    }
+
+    var addr = try std.net.Address.initUnix(opts.socket_path);
+    var server = try addr.listen(.{});
+    defer {
+        server.deinit();
+        std.fs.cwd().deleteFile(opts.socket_path) catch {};
+    }
+
+    var state = ServeState{
+        .cache_allocator = allocator,
+        .specs = resolved.specs,
+        .state_file = resolved.state_file,
+        .legacy_file = resolved.legacy_file,
+        .format = resolved.format,
+    };
+
+    while (true) {
+        var conn = try server.accept();
+        defer conn.stream.close();
+
+        var read_buf: [256]u8 = undefined;
+        const n = try conn.stream.read(&read_buf);
+        const command = std.mem.trim(u8, read_buf[0..n], " \r\n\t");
+
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const response = try handleServeCommand(arena, &state, command);
+        try conn.stream.writeAll(response);
+    }
+}
+
+fn runClientCommand(allocator: std.mem.Allocator, argv: []const [:0]u8) !void {
+    const opts = try parseClientOptions(argv);
+    var attempt: usize = 0;
+    while (attempt < 2) : (attempt += 1) {
+        var stream = std.net.connectUnixSocket(opts.socket_path) catch |err| {
+            if ((err == error.ConnectionRefused or err == error.FileNotFound) and attempt == 0) {
+                std.Thread.sleep(200 * std.time.ns_per_ms);
+                continue;
+            }
+            return err;
+        };
+        defer stream.close();
+
+        stream.writeAll(opts.command) catch |err| {
+            if (err == error.BrokenPipe and attempt == 0) {
+                std.Thread.sleep(200 * std.time.ns_per_ms);
+                continue;
+            }
+            return err;
+        };
+        stream.writeAll("\n") catch |err| {
+            if (err == error.BrokenPipe and attempt == 0) {
+                std.Thread.sleep(200 * std.time.ns_per_ms);
+                continue;
+            }
+            return err;
+        };
+
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(allocator);
+        var buf: [512]u8 = undefined;
+        while (true) {
+            const n = try stream.read(&buf);
+            if (n == 0) break;
+            try list.appendSlice(allocator, buf[0..n]);
+        }
+        const out = try list.toOwnedSlice(allocator);
+        defer allocator.free(out);
+        try std.fs.File.stdout().writeAll(out);
+        return;
+    }
+}
+
+fn runFancyssCommand(allocator: std.mem.Allocator, argv: []const [:0]u8) !void {
+    const opts = try parseDaemonOptions(argv);
     var cfg: ?ConfigFile = null;
     var owned_specs: ?[]ProbeSpec = null;
     defer if (owned_specs) |items| allocator.free(items);
@@ -847,37 +1131,11 @@ fn runDaemonCommand(allocator: std.mem.Allocator, argv: []const [:0]u8) !void {
         owned_specs = try buildFancyssProbeSpecs(allocator, opts);
     }
 
-    const interval_ms = opts.interval_ms orelse if (cfg) |cfg_file| cfg_file.interval_ms orelse 5000 else 5000;
-    const format = opts.format orelse if (cfg) |cfg_file| cfg_file.output orelse .json else .json;
-    const state_file = opts.state_file orelse if (cfg) |cfg_file| cfg_file.state_file else null;
-    const legacy_file = opts.legacy_file orelse if (cfg) |cfg_file| cfg_file.legacy_file else null;
     const specs = if (cfg) |cfg_file| cfg_file.probes else owned_specs.?;
-
-    while (true) {
-        {
-            var cycle_arena_state = std.heap.ArenaAllocator.init(allocator);
-            defer cycle_arena_state.deinit();
-            const cycle_alloc = cycle_arena_state.allocator();
-            const run_result = try runProbeList(cycle_alloc, specs);
-
-            if (state_file) |path| {
-                try writeRunResultFile(cycle_alloc, path, format, run_result);
-            }
-            if (legacy_file) |path| {
-                const legacy = try runResultToFancyssAlloc(cycle_alloc, run_result);
-                try writeBytesFile(cycle_alloc, path, legacy);
-            }
-            if (opts.stdout or opts.once) {
-                const output = switch (format) {
-                    .json => try runResultToJsonAlloc(cycle_alloc, run_result),
-                    .text => try runResultToTextAlloc(cycle_alloc, run_result),
-                };
-                try std.fs.File.stdout().writeAll(output);
-            }
-            if (opts.once) return;
-        }
-        std.Thread.sleep(@as(u64, interval_ms) * std.time.ns_per_ms);
-    }
+    const run_result = try runProbeList(allocator, specs);
+    const output = try runResultToFancyssAlloc(allocator, run_result);
+    defer allocator.free(output);
+    try std.fs.File.stdout().writeAll(output);
 }
 
 pub fn main() !void {
@@ -904,8 +1162,20 @@ pub fn main() !void {
         try runOnceCommand(gpa, argv[2..]);
         return;
     }
+    if (std.mem.eql(u8, cmd, "fancyss")) {
+        try runFancyssCommand(gpa, argv[2..]);
+        return;
+    }
     if (std.mem.eql(u8, cmd, "daemon")) {
         try runDaemonCommand(gpa, argv[2..]);
+        return;
+    }
+    if (std.mem.eql(u8, cmd, "serve")) {
+        try runServeCommand(gpa, argv[2..]);
+        return;
+    }
+    if (std.mem.eql(u8, cmd, "client")) {
+        try runClientCommand(gpa, argv[2..]);
         return;
     }
 
