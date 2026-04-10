@@ -10,6 +10,18 @@
 - 支持 IPv4 / IPv6 / auto 地址族
 - 输出延迟、HTTP 状态码、对端地址、失败原因
 - daemon 模式可持续写缓存文件，供前端或故障转移逻辑读取
+- 附带 `statusctl`，作为面向 fancyss shell / websocket 的极薄控制客户端
+
+## statusctl
+
+`statusctl` 负责通过 Unix socket 向 `status-tool serve` 发送轻量控制命令。
+
+```bash
+statusctl --socket-path /tmp/status-tool.sock probe-once
+statusctl --socket-path /tmp/status-tool.sock get-cache
+statusctl --socket-path /tmp/status-tool.sock ping
+statusctl --socket-path /tmp/status-tool.sock send probe_once
+```
 
 ## 命令
 
@@ -104,4 +116,3 @@ status-tool daemon --config ./status.json
 
 - shell / awk / sed / grep / curl 的多进程开销
 - 页面刷新导致的真实状态探测重入
-

@@ -85,6 +85,7 @@ build_target() {
     local zig_target="$2"
     local cpu="$3"
     local output="$OUT_DIR/status-tool-v${VERSION}-linux-$name"
+    local ctl_output="$OUT_DIR/statusctl-v${VERSION}-linux-$name"
     local local_cache_dir="$LOCAL_CACHE_BASE/$name"
     local upx_bin=""
 
@@ -101,6 +102,7 @@ build_target() {
         -Doptimize=ReleaseSmall
 
     cp -f "$ROOT_DIR/zig-out/bin/status-tool" "$output"
+    cp -f "$ROOT_DIR/zig-out/bin/statusctl" "$ctl_output"
 
     if [[ "$WITH_UPX" == "1" ]]; then
         case "$name" in
@@ -116,12 +118,15 @@ build_target() {
         if [[ -n "$upx_bin" ]]; then
             echo "==> packing $name with $(basename "$upx_bin")"
             "$upx_bin" --lzma --ultra-brute "$output"
+            "$upx_bin" --lzma --ultra-brute "$ctl_output"
         fi
     fi
 
     file "$output"
     stat -c '%n %s bytes' "$output"
-    BUILT_FILES+=("$(basename "$output")")
+    file "$ctl_output"
+    stat -c '%n %s bytes' "$ctl_output"
+    BUILT_FILES+=("$(basename "$output")" "$(basename "$ctl_output")")
 }
 
 TARGETS=()

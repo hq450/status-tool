@@ -25,6 +25,23 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    const ctl_module = b.createModule(.{
+        .root_source_file = b.path("src/statusctl.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .single_threaded = true,
+        .strip = optimize != .Debug,
+    });
+    ctl_module.addOptions("build_options", options);
+
+    const ctl = b.addExecutable(.{
+        .name = "statusctl",
+        .root_module = ctl_module,
+    });
+
+    b.installArtifact(ctl);
+
     const run_cmd = b.addRunArtifact(exe);
     if (b.args) |args| {
         run_cmd.addArgs(args);
