@@ -56,6 +56,29 @@ const RunResult = struct {
     results: []ProbeResult,
 };
 
+const ProbeSeries = struct {
+    allocator: std.mem.Allocator,
+    parsed: ParsedUrl,
+    spec: ProbeSpec,
+    opened: ?OpenedStream = null,
+
+    fn close(self: *ProbeSeries) void {
+        if (self.opened) |opened| {
+            opened.stream.close();
+            self.allocator.free(opened.remote_addr);
+            self.opened = null;
+        }
+    }
+
+    fn reopen(self: *ProbeSeries) !void {
+        self.close();
+        self.opened = if (self.spec.mode == .direct)
+            try openDirectStream(self.allocator, self.parsed, self.spec.family)
+        else
+            try openSocks5Stream(self.allocator, self.parsed, self.spec.proxy orelse return ProbeError.MissingProxy);
+    }
+};
+
 const ConfigFile = struct {
     interval_ms: ?u32 = null,
     state_file: ?[]const u8 = null,
@@ -67,6 +90,7 @@ const ConfigFile = struct {
 const ServeState = struct {
     cache_allocator: std.mem.Allocator,
     specs: []const ProbeSpec,
+    history_ms: []?u32,
     state_file: ?[]const u8,
     legacy_file: ?[]const u8,
     format: OutputFormat,
@@ -456,23 +480,13 @@ fn parseStatusCode(head: []const u8) !u16 {
     return try std.fmt.parseInt(u16, code_text, 10);
 }
 
-fn doSingleAttempt(allocator: std.mem.Allocator, spec: ProbeSpec) !ProbeResult {
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const parsed = try parseHttpUrl(arena, spec.url);
-    var opened = if (spec.mode == .direct)
-        try openDirectStream(allocator, parsed, spec.family)
-    else
-        try openSocks5Stream(allocator, parsed, spec.proxy orelse return ProbeError.MissingProxy);
-    defer opened.stream.close();
-
+fn doSingleAttemptOnStream(allocator: std.mem.Allocator, arena: std.mem.Allocator, spec: ProbeSpec, parsed: ParsedUrl, opened: *OpenedStream, close_after: bool) !ProbeResult {
     var timer = try std.time.Timer.start();
     const ua = spec.user_agent orelse "status-tool/" ++ version;
-    const request = try std.fmt.allocPrint(arena,
-        "{s} {s} HTTP/1.1\r\nHost: {s}\r\nUser-Agent: {s}\r\nConnection: close\r\nAccept: */*\r\n\r\n",
-        .{ "HEAD", parsed.target, parsed.host, ua },
+    const request = try std.fmt.allocPrint(
+        arena,
+        "{s} {s} HTTP/1.1\r\nHost: {s}\r\nUser-Agent: {s}\r\nConnection: {s}\r\nAccept: */*\r\n\r\n",
+        .{ "HEAD", parsed.target, parsed.host, ua, if (close_after) "close" else "keep-alive" },
     );
     try writeAll(opened.stream, request);
     const head = try readHttpResponseHead(arena, opened.stream);
@@ -485,34 +499,71 @@ fn doSingleAttempt(allocator: std.mem.Allocator, spec: ProbeSpec) !ProbeResult {
         .ok = status_code >= 200 and status_code < 400,
         .status_code = status_code,
         .elapsed_ms = elapsed_ms,
-        .remote_addr = opened.remote_addr,
+        .remote_addr = try allocator.dupe(u8, opened.remote_addr),
         .@"error" = try allocator.dupe(u8, "ok"),
         .attempts = spec.attempts,
         .warmup = spec.warmup,
     };
 }
 
-fn probeSpec(allocator: std.mem.Allocator, spec: ProbeSpec) !ProbeResult {
+fn doSingleSeriesAttempt(allocator: std.mem.Allocator, series: *ProbeSeries, close_after: bool) !ProbeResult {
+    if (series.opened == null) {
+        try series.reopen();
+    }
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    return doSingleAttemptOnStream(allocator, arena, series.spec, series.parsed, &series.opened.?, close_after) catch |err| {
+        series.reopen() catch return err;
+        return doSingleAttemptOnStream(allocator, arena, series.spec, series.parsed, &series.opened.?, close_after);
+    };
+}
+
+fn makeProbeFailure(allocator: std.mem.Allocator, spec: ProbeSpec, effective_attempts: u8, err: anyerror) !ProbeResult {
+    return .{
+        .name = try allocator.dupe(u8, spec.name),
+        .url = try allocator.dupe(u8, spec.url),
+        .ok = false,
+        .status_code = 0,
+        .elapsed_ms = 0,
+        .remote_addr = try allocator.dupe(u8, ""),
+        .@"error" = try allocator.dupe(u8, @errorName(err)),
+        .attempts = effective_attempts,
+        .warmup = spec.warmup,
+    };
+}
+
+fn probeNeedsRetry(current_ms: u32, previous_ms: ?u32) bool {
+    const prev = previous_ms orelse return false;
+    const limit_a = prev +| 100;
+    const limit_b = prev +| (prev / 2);
+    const limit = @max(limit_a, limit_b);
+    return current_ms > limit;
+}
+
+fn probeSpec(allocator: std.mem.Allocator, spec: ProbeSpec, previous_ms: ?u32) !ProbeResult {
     const effective_attempts: u8 = if (spec.attempts == 0) 1 else spec.attempts;
-    const total_rounds: usize = @as(usize, spec.warmup) + @as(usize, effective_attempts);
+    const base_attempts: u8 = if (previous_ms != null and effective_attempts > 1) 1 else effective_attempts;
+    const total_rounds: usize = @as(usize, spec.warmup) + @as(usize, base_attempts);
     var best: ?ProbeResult = null;
     var last_failure: ?ProbeResult = null;
 
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const parsed = try parseHttpUrl(arena, spec.url);
+    var series = ProbeSeries{
+        .allocator = allocator,
+        .parsed = parsed,
+        .spec = spec,
+    };
+    defer series.close();
+
     var round: usize = 0;
     while (round < total_rounds) : (round += 1) {
-        const res = doSingleAttempt(allocator, spec) catch |err| blk: {
-            break :blk ProbeResult{
-                .name = try allocator.dupe(u8, spec.name),
-                .url = try allocator.dupe(u8, spec.url),
-                .ok = false,
-                .status_code = 0,
-                .elapsed_ms = 0,
-                .remote_addr = try allocator.dupe(u8, ""),
-                .@"error" = try allocator.dupe(u8, @errorName(err)),
-                .attempts = effective_attempts,
-                .warmup = spec.warmup,
-            };
-        };
+        const close_after = (round + 1 >= total_rounds and previous_ms == null);
+        const res = doSingleSeriesAttempt(allocator, &series, close_after) catch |err|
+            try makeProbeFailure(allocator, spec, effective_attempts, err);
 
         const is_warmup = round < spec.warmup;
         if (is_warmup) continue;
@@ -523,6 +574,20 @@ fn probeSpec(allocator: std.mem.Allocator, spec: ProbeSpec) !ProbeResult {
             }
         } else {
             last_failure = res;
+        }
+    }
+
+    if (previous_ms != null and effective_attempts > base_attempts) {
+        if (best == null or probeNeedsRetry(best.?.elapsed_ms, previous_ms)) {
+            const res = doSingleSeriesAttempt(allocator, &series, true) catch |err|
+                try makeProbeFailure(allocator, spec, effective_attempts, err);
+            if (res.ok) {
+                if (best == null or res.elapsed_ms < best.?.elapsed_ms) {
+                    best = res;
+                }
+            } else {
+                last_failure = res;
+            }
         }
     }
 
@@ -541,11 +606,17 @@ fn probeSpec(allocator: std.mem.Allocator, spec: ProbeSpec) !ProbeResult {
     };
 }
 
-fn runProbeList(allocator: std.mem.Allocator, specs: []const ProbeSpec) !RunResult {
+fn runProbeList(allocator: std.mem.Allocator, specs: []const ProbeSpec, history_ms: ?[]?u32) !RunResult {
     var results = try allocator.alloc(ProbeResult, specs.len);
     const updated_at_ms = std.time.milliTimestamp();
     for (specs, 0..) |spec, i| {
-        results[i] = try probeSpec(allocator, spec);
+        const previous_ms = if (history_ms) |history| history[i] else null;
+        results[i] = try probeSpec(allocator, spec, previous_ms);
+        if (history_ms) |history| {
+            if (results[i].ok and results[i].elapsed_ms > 0) {
+                history[i] = results[i].elapsed_ms;
+            }
+        }
     }
     return .{
         .updated_at_ms = updated_at_ms,
@@ -565,7 +636,8 @@ fn runResultToTextAlloc(allocator: std.mem.Allocator, run_result: RunResult) ![]
     var list: std.ArrayList(u8) = .empty;
     errdefer list.deinit(allocator);
     for (run_result.results) |res| {
-        try list.print(allocator,
+        try list.print(
+            allocator,
             "{s}\t{s}\t{d}\t{d}\t{s}\t{s}\n",
             .{
                 if (res.name.len == 0) "-" else res.name,
@@ -951,7 +1023,7 @@ fn resolveSpecsForDaemonLike(allocator: std.mem.Allocator, opts: DaemonOptions) 
 }
 
 fn refreshServeCache(allocator: std.mem.Allocator, state: *ServeState) !void {
-    const run_result = try runProbeList(allocator, state.specs);
+    const run_result = try runProbeList(allocator, state.specs, state.history_ms);
     const legacy = try runResultToFancyssAlloc(allocator, run_result);
     if (state.state_file) |path| {
         try writeRunResultFile(allocator, path, state.format, run_result);
@@ -995,7 +1067,7 @@ fn runOnceCommand(allocator: std.mem.Allocator, argv: []const [:0]u8) !void {
         specs = cfg.probes;
         format = cfg.output orelse format;
     }
-    const run_result = try runProbeList(allocator, specs);
+    const run_result = try runProbeList(allocator, specs, null);
     const output = switch (format) {
         .json => try runResultToJsonAlloc(allocator, run_result),
         .text => try runResultToTextAlloc(allocator, run_result),
@@ -1008,13 +1080,16 @@ fn runDaemonCommand(allocator: std.mem.Allocator, argv: []const [:0]u8) !void {
     const opts = try parseDaemonOptions(argv);
     const resolved = try resolveSpecsForDaemonLike(allocator, opts);
     defer if (resolved.owned) |items| allocator.free(items);
+    const history_ms = try allocator.alloc(?u32, resolved.specs.len);
+    defer allocator.free(history_ms);
+    @memset(history_ms, null);
 
     while (true) {
         {
             var cycle_arena_state = std.heap.ArenaAllocator.init(allocator);
             defer cycle_arena_state.deinit();
             const cycle_alloc = cycle_arena_state.allocator();
-            const run_result = try runProbeList(cycle_alloc, resolved.specs);
+            const run_result = try runProbeList(cycle_alloc, resolved.specs, history_ms);
 
             if (resolved.state_file) |path| {
                 try writeRunResultFile(cycle_alloc, path, resolved.format, run_result);
@@ -1055,10 +1130,13 @@ fn runServeCommand(allocator: std.mem.Allocator, argv: []const [:0]u8) !void {
     var state = ServeState{
         .cache_allocator = allocator,
         .specs = resolved.specs,
+        .history_ms = try allocator.alloc(?u32, resolved.specs.len),
         .state_file = resolved.state_file,
         .legacy_file = resolved.legacy_file,
         .format = resolved.format,
     };
+    @memset(state.history_ms, null);
+    defer allocator.free(state.history_ms);
 
     while (true) {
         var conn = try server.accept();
@@ -1139,7 +1217,7 @@ fn runFancyssCommand(allocator: std.mem.Allocator, argv: []const [:0]u8) !void {
     }
 
     const specs = if (cfg) |cfg_file| cfg_file.probes else owned_specs.?;
-    const run_result = try runProbeList(allocator, specs);
+    const run_result = try runProbeList(allocator, specs, null);
     const output = try runResultToFancyssAlloc(allocator, run_result);
     defer allocator.free(output);
     try std.fs.File.stdout().writeAll(output);
