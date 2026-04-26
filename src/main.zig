@@ -1065,14 +1065,21 @@ fn runServeCommand(allocator: std.mem.Allocator, argv: []const [:0]u8) !void {
         defer conn.stream.close();
 
         var read_buf: [256]u8 = undefined;
-        const n = try conn.stream.read(&read_buf);
+        const n = conn.stream.read(&read_buf) catch continue;
+        if (n == 0) continue;
         const command = std.mem.trim(u8, read_buf[0..n], " \r\n\t");
+        if (command.len == 0) continue;
 
         var arena_state = std.heap.ArenaAllocator.init(allocator);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
-        const response = try handleServeCommand(arena, &state, command);
-        try conn.stream.writeAll(response);
+        const response = handleServeCommand(arena, &state, command) catch |err| {
+            _ = conn.stream.write("error: ") catch {};
+            _ = conn.stream.write(@errorName(err)) catch {};
+            _ = conn.stream.write("\n") catch {};
+            continue;
+        };
+        conn.stream.writeAll(response) catch continue;
     }
 }
 
