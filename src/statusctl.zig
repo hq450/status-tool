@@ -6,6 +6,7 @@ const version = build_options.version;
 const Options = struct {
     socket_path: []const u8 = "/tmp/status-tool.sock",
     command: []const u8,
+    timeout_ms: u32 = 10000,
 };
 
 fn printUsage() void {
@@ -17,6 +18,7 @@ fn printUsage() void {
         \\  statusctl [--socket-path <path>] get-cache
         \\  statusctl [--socket-path <path>] ping
         \\  statusctl [--socket-path <path>] send <raw-command>
+        \\  --timeout-ms <ms>  read/write timeout, default 10000
         \\  statusctl --help
         \\  statusctl --version
         \\
@@ -32,6 +34,7 @@ fn mapCommand(cmd: []const u8) ?[]const u8 {
 
 fn parseOptions(allocator: std.mem.Allocator, argv: []const [:0]u8) !Options {
     var socket_path: []const u8 = "/tmp/status-tool.sock";
+    var timeout_ms: u32 = 10000;
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
         const arg = argv[i];
@@ -41,18 +44,26 @@ fn parseOptions(allocator: std.mem.Allocator, argv: []const [:0]u8) !Options {
             socket_path = argv[i];
             continue;
         }
+        if (std.mem.eql(u8, arg, "--timeout-ms")) {
+            i += 1;
+            if (i >= argv.len) return error.InvalidArgument;
+            timeout_ms = try std.fmt.parseInt(u32, argv[i], 10);
+            continue;
+        }
         if (std.mem.eql(u8, arg, "send")) {
             i += 1;
             if (i >= argv.len) return error.InvalidArgument;
             return .{
                 .socket_path = socket_path,
                 .command = try allocator.dupe(u8, argv[i]),
+                .timeout_ms = timeout_ms,
             };
         }
         if (mapCommand(arg)) |mapped| {
             return .{
                 .socket_path = socket_path,
                 .command = mapped,
+                .timeout_ms = timeout_ms,
             };
         }
         return error.InvalidArgument;
@@ -67,6 +78,21 @@ fn writeAll(stream: std.net.Stream, bytes: []const u8) !void {
         if (n == 0) return error.WriteFailed;
         sent += n;
     }
+}
+
+fn timeoutTimeval(timeout_ms: u32) std.posix.timeval {
+    return .{
+        .sec = @intCast(timeout_ms / 1000),
+        .usec = @intCast((timeout_ms % 1000) * 1000),
+    };
+}
+
+fn setStreamTimeout(stream: std.net.Stream, timeout_ms: u32) void {
+    if (timeout_ms == 0) return;
+    const tv = timeoutTimeval(timeout_ms);
+    const bytes = std.mem.asBytes(&tv);
+    std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, bytes) catch {};
+    std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, bytes) catch {};
 }
 
 fn readAndPrintAll(stream: std.net.Stream) !void {
@@ -119,6 +145,7 @@ pub fn main() !void {
             return err;
         };
         defer stream.close();
+        setStreamTimeout(stream, opts.timeout_ms);
 
         writeAll(stream, opts.command) catch |err| {
             if (err == error.BrokenPipe and attempt == 0) {

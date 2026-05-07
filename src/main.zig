@@ -73,9 +73,9 @@ const ProbeSeries = struct {
     fn reopen(self: *ProbeSeries) !void {
         self.close();
         self.opened = if (self.spec.mode == .direct)
-            try openDirectStream(self.allocator, self.parsed, self.spec.family)
+            try openDirectStream(self.allocator, self.parsed, self.spec.family, self.spec.timeout_ms)
         else
-            try openSocks5Stream(self.allocator, self.parsed, self.spec.proxy orelse return ProbeError.MissingProxy);
+            try openSocks5Stream(self.allocator, self.parsed, self.spec.proxy orelse return ProbeError.MissingProxy, self.spec.timeout_ms);
     }
 };
 
@@ -104,6 +104,62 @@ const ParsedUrl = struct {
     port: u16,
     target: []const u8,
 };
+
+fn timeoutTimeval(timeout_ms: u32) std.posix.timeval {
+    return .{
+        .sec = @intCast(timeout_ms / 1000),
+        .usec = @intCast((timeout_ms % 1000) * 1000),
+    };
+}
+
+fn setStreamTimeout(stream: std.net.Stream, timeout_ms: u32) void {
+    if (timeout_ms == 0) return;
+    const tv = timeoutTimeval(timeout_ms);
+    const bytes = std.mem.asBytes(&tv);
+    std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, bytes) catch {};
+    std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, bytes) catch {};
+}
+
+fn setSocketBlocking(sockfd: std.posix.socket_t, blocking: bool) !void {
+    const nonblock_flag = @as(usize, 1) << @bitOffsetOf(std.posix.O, "NONBLOCK");
+    var flags = try std.posix.fcntl(sockfd, std.posix.F.GETFL, 0);
+    if (blocking) {
+        flags &= ~nonblock_flag;
+    } else {
+        flags |= nonblock_flag;
+    }
+    _ = try std.posix.fcntl(sockfd, std.posix.F.SETFL, flags);
+}
+
+fn tcpConnectToAddressTimeout(address: std.net.Address, timeout_ms: u32) !std.net.Stream {
+    if (timeout_ms == 0) {
+        return std.net.tcpConnectToAddress(address);
+    }
+    const sockfd = try std.posix.socket(
+        address.any.family,
+        std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC | std.posix.SOCK.NONBLOCK,
+        std.posix.IPPROTO.TCP,
+    );
+    errdefer std.net.Stream.close(.{ .handle = sockfd });
+
+    std.posix.connect(sockfd, &address.any, address.getOsSockLen()) catch |err| switch (err) {
+        error.WouldBlock, error.ConnectionPending => {},
+        else => return err,
+    };
+
+    var fds = [_]std.posix.pollfd{.{
+        .fd = sockfd,
+        .events = std.posix.POLL.OUT,
+        .revents = 0,
+    }};
+    const poll_ms = @as(i32, @intCast(@min(timeout_ms, @as(u32, @intCast(std.math.maxInt(i32))))));
+    const ready = try std.posix.poll(&fds, poll_ms);
+    if (ready == 0) return error.ConnectionTimedOut;
+    try std.posix.getsockoptError(sockfd);
+    try setSocketBlocking(sockfd, true);
+
+    return .{ .handle = sockfd };
+}
 
 const OpenedStream = struct {
     stream: std.net.Stream,
@@ -363,17 +419,22 @@ fn addressToOwnedString(allocator: std.mem.Allocator, addr: std.net.Address) ![]
     return try std.fmt.allocPrint(allocator, "{f}", .{addr});
 }
 
-fn openDirectStream(allocator: std.mem.Allocator, parsed: ParsedUrl, family: Family) !OpenedStream {
+fn openDirectStream(allocator: std.mem.Allocator, parsed: ParsedUrl, family: Family, timeout_ms: u32) !OpenedStream {
     const list = try std.net.getAddressList(allocator, parsed.host, parsed.port);
     defer list.deinit();
 
     var last_err: ?anyerror = null;
+    var timer = try std.time.Timer.start();
     for (list.addrs) |addr| {
         if (!addressFamilyMatches(addr, family)) continue;
-        const stream = std.net.tcpConnectToAddress(addr) catch |err| {
+        const elapsed_ms: u32 = @intCast(@min(timer.read() / std.time.ns_per_ms, std.math.maxInt(u32)));
+        if (elapsed_ms >= timeout_ms) break;
+        const remaining_ms = timeout_ms - elapsed_ms;
+        const stream = tcpConnectToAddressTimeout(addr, remaining_ms) catch |err| {
             last_err = err;
             continue;
         };
+        setStreamTimeout(stream, timeout_ms);
         return .{
             .stream = stream,
             .remote_addr = try addressToOwnedString(allocator, addr),
@@ -402,14 +463,15 @@ fn readExact(stream: std.net.Stream, buf: []u8) !void {
     }
 }
 
-fn openSocks5Stream(allocator: std.mem.Allocator, parsed: ParsedUrl, proxy_text: []const u8) !OpenedStream {
+fn openSocks5Stream(allocator: std.mem.Allocator, parsed: ParsedUrl, proxy_text: []const u8, timeout_ms: u32) !OpenedStream {
     const proxy = try parseProxyEndpoint(proxy_text);
     var opened = try openDirectStream(allocator, .{
         .raw = proxy_text,
         .host = proxy.host,
         .port = proxy.port,
         .target = "",
-    }, .auto);
+    }, .auto, timeout_ms);
+    setStreamTimeout(opened.stream, timeout_ms);
     errdefer opened.stream.close();
 
     try writeAll(opened.stream, &[_]u8{ 0x05, 0x01, 0x00 });
@@ -489,6 +551,7 @@ fn doSingleAttemptOnStream(allocator: std.mem.Allocator, arena: std.mem.Allocato
         .{ "HEAD", parsed.target, parsed.host, ua, if (close_after) "close" else "keep-alive" },
     );
     try writeAll(opened.stream, request);
+    setStreamTimeout(opened.stream, spec.timeout_ms);
     const head = try readHttpResponseHead(arena, opened.stream);
     const elapsed_ms: u32 = @intCast(@min(timer.read() / std.time.ns_per_ms, std.math.maxInt(u32)));
     const status_code = try parseStatusCode(head);
@@ -566,7 +629,13 @@ fn probeSpec(allocator: std.mem.Allocator, spec: ProbeSpec, previous_ms: ?u32) !
             try makeProbeFailure(allocator, spec, effective_attempts, err);
 
         const is_warmup = round < spec.warmup;
-        if (is_warmup) continue;
+        if (is_warmup) {
+            if (!res.ok) {
+                last_failure = res;
+                break;
+            }
+            continue;
+        }
 
         if (res.ok) {
             if (best == null or res.elapsed_ms < best.?.elapsed_ms) {
